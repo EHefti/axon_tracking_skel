@@ -191,6 +191,48 @@ def plot_template_overview(
         plt.savefig(full_filename)
 
 
+def plot_template_overview2(
+    root_path,
+    n_cols=3,
+    vmin=-10,
+    vmax=0,
+    foldername="templates",
+    filename="overview",
+    unit_ids=None,
+    overwrite=False,
+):
+    full_filename = os.path.join(root_path, foldername, filename + ".png")
+    if os.path.exists(full_filename) and not overwrite:
+        display(Image(filename=full_filename))
+    else:
+        template_folder = os.path.join(root_path, foldername)
+        files = os.listdir(template_folder)
+        template_files = [
+            f for f in files if "_" not in f if "overview" not in f if ".npy" in f
+        ]
+        ids = [float(t.split(".")[0]) for t in template_files]
+        if unit_ids is not None:
+            sort_idx = [ids.index(x) for x in unit_ids]
+        else:
+            sort_idx = np.argsort(ids)
+        template_files = [template_files[i] for i in sort_idx]
+
+        n_rows = int(np.ceil(len(template_files) / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows))
+        for i, template_file in enumerate(template_files):
+            template_path = os.path.join(template_folder, template_file)
+            template = np.load(template_path)
+            temp_diff = np.diff(template)
+            tmp_filt = nd.gaussian_filter(temp_diff, sigma=1)
+            plt.subplot(n_rows, n_cols, i + 1)
+            plt.imshow(
+                np.min(tmp_filt, axis=2).T, vmin=vmin, vmax=vmax, cmap="gist_heat"
+            )
+            plt.title(template_file)
+
+        plt.savefig(full_filename)
+
+
 def plot_waveforms(template):
     flat_tmp = np.reshape(template.transpose((2, 0, 1)), [template.shape[2], -1])
     plt.plot(flat_tmp)
