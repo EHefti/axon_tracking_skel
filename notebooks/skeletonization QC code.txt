@@ -1,0 +1,146 @@
+from skimage.feature import peak_local_max
+from scipy.ndimage import binary_dilation, generate_binary_structure
+
+
+def identify_ubiquitous_peaks(templates, min_distance=5, threshold_abs=None, threshold_rel=0.1):
+    """
+    Calculates the median and finds peaks using skimage.feature.peak_local_max.
+
+    Args:
+        templates: List of 3D numpy arrays.
+        min_distance: Minimum distance between peaks (in voxels).
+        threshold_abs: Absolute intensity threshold.
+        threshold_rel: Relative intensity threshold (fraction of max value).
+
+    Returns:
+        median_template, peak_coordinates (as a NumPy array)
+    """
+    stacked_templates = np.stack(templates, axis=0)
+    median_template = np.median(stacked_templates, axis=0)
+    # print(median_template.shape[:2])
+
+    peak_coordinates = peak_local_max(
+        median_template,
+        min_distance=min_distance,
+        threshold_abs=threshold_abs,
+        threshold_rel=threshold_rel,
+    )
+    # print(peak_coordinates)
+
+    return median_template, peak_coordinates
+
+
+
+def calculate_peak_mask(sorter_path, input_folder, min_distance=5, threshold_abs=None, threshold_rel=0.1, dilation_iterations=3):
+    """
+    This function creates a median template, detects peaks, removes these peaks from each template, and saves them to a new folder.
+
+    Args:
+        input_folder: Path to the original templates (.npy files).
+        output_folder: Path for the processed templates.
+        min_distance: Minimum distance between peaks.
+        threshold_abs: Absolute intensity threshold for peak detection.
+        threshold_rel: Relative intensity threshold for peak detection (fraction of max).
+        dilation_iterations: Number of iterations for dilating the peak mask.
+    """
+
+    # Create paths
+    input_path = os.path.join(sorter_path, input_folder)
+    
+    # Load Templates
+    template_files = [f for f in os.listdir(input_path) if f.endswith('.npy')]
+    templates = []
+    for file in template_files:
+        filepath = os.path.join(input_path, file)
+        template = np.load(filepath)  # Load using np.load for .npy files
+        templates.append(template)
+
+    # Average and Find Peaks (using the skimage function)
+    median_template, peak_coordinates = identify_ubiquitous_peaks(templates, 
+                                                                  min_distance = min_distance, 
+                                                                  threshold_abs = threshold_abs, 
+                                                                  threshold_rel = threshold_rel)
+
+    # Create a Mask for Peak Removal
+    peak_mask = np.zeros(median_template.shape[:2], dtype=bool)
+    for x, y, z in peak_coordinates:
+        peak_mask[x, y] = True
+
+    # Dilate the mask, so we also remove the region around the peak, not only the peak itself
+    struct = generate_binary_structure(2, 1)
+    dilated_peak_mask = binary_dilation(peak_mask, structure=struct, iterations=dilation_iterations)
+    
+    return dilated_peak_mask, templates, template_files
+
+
+def peak_mask_processing(sorter_path, output_folder, dilated_peak_mask, templates, template_files, ais_rad=10):
+    """
+    Processes templates, removing peaks identified by a 2D dilated mask,
+    preserving a 2D region around the axon initial segment (AIS).
+
+    Args:
+        sorter_path: Base path.
+        output_folder: Output folder name.
+        dilated_peak_mask: The boolean mask of regions to remove.
+        templates: List of numpy arrays.
+        template_files: List of filenames.
+        ais_rad: Radius around the AIS to protect (2D).
+    """
+    output_path = os.path.join(sorter_path, output_folder)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    for i, template in enumerate(templates):
+        processed_template = template.copy()
+
+        # Find AIS location (maximum value in the template)
+        ais_flattened_index = np.argmax(template)
+        ais_x, ais_y, ais_z = np.unravel_index(ais_flattened_index, template.shape)
+
+        # Create a mask for AIS protection (circular)
+        x, y = np.indices(template.shape[:2])  # Only first two dimensions
+        ais_protection_coor = (np.sqrt((x - ais_x)**2 + (y - ais_y)**2) <= ais_rad)
+
+        # Combine the masks:
+        removal_mask = dilated_peak_mask & ~ais_protection_mask
+
+        # Apply the removal mask to the template
+        processed_template[removal_mask] = 0
+
+        output_filename = os.path.join(output_path, template_files[i])
+        np.save(output_filename, processed_template)
+
+    print(f"Processed templates saved to: {output_folder}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+input_folder = "templates"
+output_folder = "templates_processed"
+
+dilated_peak_mask, templates = calculate_peak_mask(overview_path, input_folder, min_distance=5, threshold_rel=0.2, dilation_iterations=2)
+
+print(dilated_peak_mask.shape)
+cmap = plt.cm.colors.ListedColormap(['white', 'blue'])
+plt.imshow(dilated_peak_mask.T, cmap=cmap, origin='upper')
+plt.show()
+
+
+
+
+
+
+
+
+
+peak_mask_processing(overview_path, output_folder, dilated_peak_mask, templates, template_files, ais_rad = 10)

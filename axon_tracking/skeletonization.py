@@ -137,6 +137,10 @@ def localize_ais(input_mat, params):
         np.abs(input_mat), min_distance=3, threshold_rel=0.1, num_peaks=10
     )
 
+    # Safety check for no peaks
+    if local_max.size == 0:
+        return input_mat, np.array([])
+
     if (
         params["ais_detection"] == "dev"
     ):  # Search for the minimum deviation from expected peak time
