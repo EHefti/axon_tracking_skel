@@ -11,6 +11,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 from skimage.feature import peak_local_max
 from skimage.morphology import ball
+from scipy.ndimage import binary_dilation, generate_binary_structure
+import matplotlib.pyplot as plt
 
 from axon_tracking import utils as ut
 
@@ -576,3 +578,335 @@ def path_to_vertices(path_list, params, unscale=True):
     sorted_indices = np.argsort(vertices[:, 2])
     sorted_vertices = vertices[sorted_indices, :]
     return sorted_vertices
+
+
+
+# ---------------------------------------------- Extra - Removal of peaks on every Template ---------------------------------------------------- #
+
+
+
+def identify_ubiquitous_peaks(templates, min_distance=5, threshold_abs=None, threshold_rel=0.1):
+    """
+    Calculates the median and finds peaks using skimage.feature.peak_local_max.
+
+    Args:
+        templates: List of 3D numpy arrays.
+        min_distance: Minimum distance between peaks (in voxels).
+        threshold_abs: Absolute intensity threshold.
+        threshold_rel: Relative intensity threshold (fraction of max value).
+
+    Returns:
+        median_template, peak_coordinates (as a NumPy array)
+    """
+    stacked_templates = np.stack(templates, axis=0)
+    median_template = np.median(stacked_templates, axis=0)
+    # print(median_template.shape[:2])
+
+    peak_coordinates = peak_local_max(
+        median_template,
+        min_distance=min_distance,
+        threshold_abs=threshold_abs,
+        threshold_rel=threshold_rel,
+        exclude_border=False
+    )
+    # print(peak_coordinates)
+
+    return median_template, peak_coordinates
+
+
+
+def calculate_peak_mask(sorter_path, input_folder, min_distance=5, threshold_abs=None, threshold_rel=0.1, dilation_iterations=3):
+    """
+    This function creates a median template, detects peaks, removes these peaks from each template, and saves them to a new folder.
+
+    Args:
+        input_folder: Path to the original templates (.npy files).
+        output_folder: Path for the processed templates.
+        min_distance: Minimum distance between peaks.
+        threshold_abs: Absolute intensity threshold for peak detection.
+        threshold_rel: Relative intensity threshold for peak detection (fraction of max).
+        dilation_iterations: Number of iterations for dilating the peak mask.
+    """
+
+    # Create paths
+    input_path = os.path.join(sorter_path, input_folder)
+    
+    # Load Templates
+    template_files = [f for f in os.listdir(input_path) if f.endswith('.npy')]
+    templates = []
+    for file in template_files:
+        filepath = os.path.join(input_path, file)
+        template = np.load(filepath)  # Load using np.load for .npy files
+        templates.append(template)
+
+    # Average and Find Peaks (using the skimage function)
+    median_template, peak_coordinates = identify_ubiquitous_peaks(templates, 
+                                                                  min_distance = min_distance, 
+                                                                  threshold_abs = threshold_abs, 
+                                                                  threshold_rel = threshold_rel)
+
+    # Create a Mask for Peak Removal
+    peak_mask = np.zeros(median_template.shape[:2], dtype=bool)
+    for x, y, z in peak_coordinates:
+        peak_mask[x, y] = True
+
+    # Dilate the mask, so we also remove the region around the peak, not only the peak itself
+    struct = generate_binary_structure(2, 1)
+    dilated_peak_mask = binary_dilation(peak_mask, structure=struct, iterations=dilation_iterations)
+    
+    return dilated_peak_mask, templates, template_files
+
+
+def peak_mask_processing(sorter_path, output_folder, dilated_peak_mask, templates, template_files, ais_rad=10):
+    """
+    Processes templates, removing peaks identified by a 2D dilated mask,
+    preserving a 2D region around the axon initial segment (AIS).
+
+    Args:
+        sorter_path: Base path.
+        output_folder: Output folder name.
+        dilated_peak_mask: The boolean mask of regions to remove.
+        templates: List of numpy arrays.
+        template_files: List of filenames.
+        ais_rad: Radius around the AIS to protect (2D).
+    """
+    output_path = os.path.join(sorter_path, output_folder)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    processed_templates = []
+    for i, template in enumerate(templates):
+        processed_template = template.copy()
+
+        # Find AIS location (maximum value in the template)
+        ais_flattened_index = np.argmax(template)
+        ais_x, ais_y, ais_z = np.unravel_index(ais_flattened_index, template.shape)
+
+        # Create a mask for AIS protection (circular)
+        x, y = np.indices(template.shape[:2])  # Only first two dimensions
+        ais_protection_coor = (np.sqrt((x - ais_x)**2 + (y - ais_y)**2) <= ais_rad)
+        ais_protection_mask = np.zeros(template.shape[:2], dtype=bool)
+        ais_protection_mask[ais_protection_coor] = True
+
+        # Combine the masks:
+        removal_mask = dilated_peak_mask & ~ais_protection_mask
+
+        # Apply the removal mask to the template
+        processed_template[removal_mask] = 0
+
+        processed_templates.append(processed_template)
+        output_filename = os.path.join(output_path, template_files[i])
+        np.save(output_filename, processed_template)
+
+    print(f"Processed templates saved to: {output_folder}")
+    return processed_templates
+
+
+
+
+# ---------------------------------------------- Extra - Removal of noisy templates ---------------------------------------------------- #
+
+
+
+
+
+def show_template(template, group, snr, noise):
+    temp_diff = np.diff(template)
+    tmp_filt = nd.gaussian_filter(temp_diff, sigma=1)
+    plt.imshow(np.min(tmp_filt, axis=2).T, vmin=-10, vmax=0, cmap="gist_heat")
+    plt.title(f"Shown: {group} - SNR: {snr:.2f} - Noise: {noise:.2f}")
+    plt.show()
+
+def remove_noisy_templates(templates, template_files, noise_threshold=0.5, snr_threshold=100, show_which="none"):
+    """
+    Removes templates with a low signal-to-noise ratio (SNR).
+
+    Args:
+        templates: List of 3D numpy arrays.
+        noise_threshold: Minimum noise level to check a template for SNR.
+        snr_threshold: Minimum SNR to keep a template.
+        show_which: Which templates to show ("good", "bad", "all", "none").
+
+    Returns:
+        List of templates with Noise below threshold or SNR above the threshold.
+    """
+    good_templates = templates.copy()
+    unique_files = template_files.copy()
+    bad_templates = []
+    for i, template in enumerate(good_templates):
+        noise = np.median(generate_noise_matrix(template, mode="mad"))
+        signal = np.abs(np.min(template))
+        snr = signal / noise
+
+        # Only for high noise levels, we want to consider removing them
+        if noise > noise_threshold:
+            
+            if snr < snr_threshold:
+                bad_templates.append(template)
+                good_templates.pop(i)
+                unique_files.pop(i)
+                
+                if show_which == "bad":
+                    show_template(template, show_which, snr, noise)
+        
+        
+        # Showing the templates
+        if noise < noise_threshold or snr > snr_threshold:
+            if show_which == "good":
+                show_template(template, show_which, snr, noise)
+        
+        if show_which == "all": 
+            show_template(template, show_which, snr, noise)
+
+    return good_templates, unique_files
+
+
+
+
+# ---------------------------------------------- Extra - Removal of duplicates ---------------------------------------------------- #
+
+
+
+
+def keep_percentile_2D(template, percentile=10):
+    """
+    Keeps only the most negative signal values in a template,
+    setting all other values to zero.
+
+    Args:
+        template: A NumPy array (presumably 3D, but works for any dimension).
+        Percentile: How many percent should be kept
+
+    Returns:
+        Thresholded NumPy array flattened to 2D.
+    """
+    if not isinstance(template, np.ndarray):
+        raise TypeError("Input must be a NumPy array.")
+
+    template_2D = np.min(template, axis=2)
+
+    # Identify all negative values
+    negative_mask = template_2D < 0
+    negative_values = template_2D[negative_mask]
+
+    # Determine the threshold at the corresponding percentile
+    threshold_value = np.percentile(negative_values, percentile)
+
+    # Create a mask for the values to keep
+    keep_mask = (template_2D <= threshold_value) & negative_mask
+
+    # Use the mask on the output template
+    output_template = template_2D.copy()
+    output_template[~keep_mask] = 0
+
+    return output_template
+
+
+def show_duplicates(template1, peak1, i, template2, peak2, j):
+    """
+    Show the duplicates and their corresponding AIS given the templates and their peaks.
+    """
+    temp_diff = np.diff(template1)
+    tmp_filt = nd.gaussian_filter(temp_diff, sigma=1)
+    plt.subplot(1, 2, 1)
+    plt.imshow(
+        np.min(tmp_filt, axis=2).T, vmin=-10, vmax=0, cmap="gist_heat"
+    )
+    plt.scatter(peak1[0], peak1[1], marker='x', color='blue', s=20)
+    plt.title(f"Template {i}")
+
+    temp_diff2 = np.diff(template2)
+    tmp_filt2 = nd.gaussian_filter(temp_diff2, sigma=1)
+    plt.subplot(1, 2, 2)
+    plt.imshow(
+        np.min(tmp_filt2, axis=2).T, vmin=-10, vmax=0, cmap="gist_heat"
+    )
+    plt.scatter(peak2[0], peak2[1], marker='x', color='blue', s=20)
+    plt.title(f"Template {j}")
+    plt.show()
+
+    print(f"Peak 1: {peak1} and Peak 2: {peak2}")
+
+
+def remove_duplicate_templates_euc(templates, filtered_files, params, dist_threshold=5, corr_threshold=0.9, percentile=10):
+    """
+    Removes duplicate templates by comparing the templates to each other.
+    Args:
+        processed_templates: List of 3D numpy arrays.
+        params: Dictionary with parameters.
+        rad: Radius which is considered as the same AIS
+        threshold: Correlation threshold for considering two templates as duplicates.
+    Returns:
+        List of unique templates.
+    """
+
+    # Find all the AIS on the templates and remove the ones without an AIS
+    peaks = []
+    unique_files_temp = filtered_files.copy()
+    for i, template in enumerate(templates):
+        matrix_capped, peak = localize_ais(template, params)
+        if peak.size != 0:
+            peaks.append(peak)
+        else:
+            templates.pop(i)
+            unique_files_temp.pop(i)
+    
+
+    to_remove = np.array([False for _ in range(len(templates))])
+    m = len(peaks)
+    euc_dist = pdist(peaks, 'euclidean')
+    # condensed matrix: distance saved at m * i + j - ((i + 2) * (i + 1)) // 2
+    print(euc_dist)
+
+
+    for idx, dist in enumerate(euc_dist):
+        
+        # Check for elements that are below the distance threshold
+        if dist < dist_threshold:
+            rows, cols = np.triu_indices(m, k=1)
+            i = rows[idx]
+            j = cols[idx]
+
+            # Flatten everything except the 10 negative percentile and return 2D array
+            percentiled_template1 = keep_percentile_2D(templates[i], percentile)
+            percentiled_template2 = keep_percentile_2D(templates[j], percentile)
+
+            flattened_template1 = percentiled_template1.flatten()
+            flattened_template2 = percentiled_template2.flatten()
+
+            double_zeros = np.array([False for _ in range(flattened_template1.size)])
+            for k, val in enumerate(flattened_template1):
+                if flattened_template1[k] == 0 and flattened_template2[k] == 0:
+                    double_zeros[k] = True
+            
+            flattened_template1 = flattened_template1[~double_zeros]
+            flattened_template2 = flattened_template2[~double_zeros]
+
+            # Only correlate the non-zero values
+            correlation = np.corrcoef(flattened_template1, flattened_template2)[0, 1]
+            # print(f"Correlation between {i} and {j}: {correlation: .2f}")
+            
+            # We classify them as duplicates if the correlation is below the threshold
+            if correlation > corr_threshold:
+                print(f"Template {i} and {j} are duplicates")
+                noise_level1 = np.mean(generate_noise_matrix(templates[i], mode="mad"))
+                noise_level2 = np.mean(generate_noise_matrix(templates[j], mode="mad"))
+                
+                if noise_level1 < noise_level2:
+                    show_duplicates(templates[i], peaks[i], i, templates[j], peaks[j], j)
+                    to_remove[j] = True
+                    print(f"Template {j} was removed")
+                else:
+                    show_duplicates(templates[i], peaks[i], i, templates[j], peaks[j], j)
+                    to_remove[i] = True
+                    print(f"Template {i} was removed")
+
+    
+    unique_templates = []
+    unique_files = []
+    for i, template in enumerate(templates):
+        if ~to_remove[i]:
+            unique_templates.append(template)
+            unique_files.append(unique_files_temp[i])
+
+    return unique_templates, unique_files
